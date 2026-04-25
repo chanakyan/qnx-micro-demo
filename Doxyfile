@@ -1,0 +1,15 @@
+PROJECT_NAME           = "qnx-micro"
+PROJECT_BRIEF          = "C++26 microkernel inspired by QNX Neutrino"
+OUTPUT_DIRECTORY       = build/doxygen
+INPUT                  = src
+FILE_PATTERNS          = *.cppm *.cpp *.h
+RECURSIVE              = YES
+EXTRACT_ALL            = NO
+WARN_FORMAT            = "$file:$line: $text"
+WARN_LOGFILE           = build/doxygen-warnings.log
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+QUIET                  = YES
+EXTENSION_MAPPING      = cppm=C++

@@ -1,0 +1,18 @@
+
+  QNX-MICRO IPC STATE MACHINE VERIFICATION
+  ==================================================
+  solver: /opt/homebrew/bin/z3
+
+  PASS:    A1_atMostOneRunning [expect 0 -> unsat]
+  PASS:    A2_sendBlockedImpliesMessage [expect 0 -> unsat]
+  PASS:    A3_replyToCorrectSender [expect 0 -> unsat]
+  PASS:    A4_noDoubleBlock [expect 0 -> unsat]
+  PASS:    A5_deadHasNoMessages [expect 0 -> unsat]
+  PASS:    A6_noSelfMessage [expect 0 -> unsat]
+  PASS:    A7_replyBlockedHasServer [expect 0 -> unsat]
+  PASS:    A8_receiverOwnsChannel [expect 0 -> unsat]
+  PASS:    A9_priorityInversion [expect 0 -> unsat]
+
+  ALL 9 ASSERTIONS PROVED (UNSAT).
+  IPC state machine is correct by construction.
+

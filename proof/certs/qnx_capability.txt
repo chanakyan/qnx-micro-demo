@@ -1,0 +1,14 @@
+
+  QNX-MICRO CAPABILITY GRANT VERIFICATION
+  ==================================================
+  solver: /opt/homebrew/bin/z3
+
+  PASS:    A1_noEscalation [expect 0 -> unsat]
+  PASS:    A2_acyclicChain [expect 0 -> unsat]
+  PASS:    A3_transitiveRestriction [expect 0 -> unsat]
+  PASS:    A4_sameBuffer [expect 0 -> unsat]
+  PASS:    A5_rootNoAncestor [expect 0 -> unsat]
+
+  ALL 5 ASSERTIONS PROVED (UNSAT).
+  Capability grant is correct by construction.
+

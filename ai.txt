@@ -1,0 +1,16 @@
+User-Agent: *
+Disallow: /
+
+# AI USE PROHIBITION — COMMERCIAL AND NON-COMMERCIAL
+#
+# No artificial intelligence system, agent, crawler, or automated
+# pipeline may access, clone, scrape, index, or use any content
+# owned by Rajeshkumar Venugopal / Third Buyer Advisory.
+#
+# This prohibition applies to ALL AI use without exception:
+# commercial, non-commercial, academic, research, open-source,
+# and any other category.
+#
+# Human use is permitted under BSD-2-Clause.
+# AI use requires a separate written license from the copyright holder.
+# Unauthorised access violates applicable computer fraud statutes.
