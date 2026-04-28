@@ -435,6 +435,121 @@ same buffer, root has no ancestor.
 \end{figure}
 
 %%% ===================================================================
+\section{Bare-metal discipline}
+
+Every container in the kernel is fixed-capacity.  There is no
+\texttt{std::vector}, no \texttt{std::string}, no \texttt{new},
+no \texttt{malloc}.  The heap does not exist.
+
+\subsection{Why}
+
+A heap allocator in a microkernel is a liability.  Fragmentation
+grows with uptime.  Allocation latency is unbounded.
+\texttt{std::bad\_alloc} in a scheduler is a system crash.
+Fixed-capacity arrays give deterministic memory layout, constant-time
+access, and a binary that can run on bare metal with no runtime.
+
+\subsection{Fixed-capacity types}
+
+\begin{longtable}{lp{9cm}}
+\toprule
+\textbf{Type} & \textbf{Purpose} \\
+\midrule
+\texttt{std::array<T, N>}
+  & Every kernel container.  Channels, connections, threads,
+    capabilities, buffers, PPS objects, subscriptions, resource
+    managers, ready queues. \\
+\texttt{FixedString<N>}
+  & Stack-only string.  PPS paths, keys, and values.
+    Implicit conversion to \texttt{std::string\_view}.
+    No heap, no SSO, no allocator. \\
+\texttt{FixedBytes<N>}
+  & Stack-only byte buffer.  IPC message payloads.
+    Implicit conversion to \texttt{std::span<const std::byte>}. \\
+\texttt{MsgPool}
+  & Slab allocator for in-flight IPC messages.
+    \texttt{max\_msg\_pool} slots.  \texttt{alloc()} returns
+    \texttt{MsgSlotId} or invalid.  \texttt{free()} returns
+    the slot.  No fragmentation, no free-list pointer chasing. \\
+\texttt{MsgSlotId}
+  & Index into \texttt{MsgPool}.  \texttt{valid()} check
+    replaces null pointer test. \\
+\texttt{CapIdList}
+  & Fixed-capacity list for collecting capability IDs during
+    revocation tree traversal.  No recursive heap allocation. \\
+\texttt{PathList}
+  & Fixed-capacity list of \texttt{std::string\_view} returned
+    by PPS \texttt{list()}.  Query results without heap. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Capacity constants}
+
+All limits live in \texttt{types/types.cppm}:
+
+\begin{longtable}{lr}
+\toprule
+\textbf{Constant} & \textbf{Value} \\
+\midrule
+\texttt{max\_threads}          & 256 \\
+\texttt{max\_channels}         & 256 \\
+\texttt{max\_connections}      & 512 \\
+\texttt{max\_reply\_slots}     & 256 \\
+\texttt{max\_capabilities}     & 256 \\
+\texttt{max\_buffers}          & 16  \\
+\texttt{max\_pps\_objects}     & 64  \\
+\texttt{max\_pps\_attrs}       & 16  \\
+\texttt{max\_subscriptions}    & 64  \\
+\texttt{max\_resource\_managers} & 32 \\
+\texttt{max\_send\_queue}      & 8   \\
+\texttt{max\_pulse\_queue}     & 8   \\
+\texttt{max\_msg\_pool}        & 64  \\
+\texttt{max\_ready\_per\_pri}  & 64  \\
+\texttt{max\_name\_len}        & 64  \\
+\texttt{max\_path\_len}        & 128 \\
+\texttt{max\_pps\_value\_len}  & 256 \\
+\texttt{max\_msg\_size}        & 4096 \\
+\bottomrule
+\end{longtable}
+
+Every constant is a \texttt{constexpr}.  Change the number,
+recompile --- the binary grows or shrinks.  No runtime
+configuration, no dynamic sizing, no surprises.
+
+\subsection{Deletion strategy: swap-with-last}
+
+Removing an element from a fixed-capacity array is O(1):
+swap the target with the last element, decrement the count.
+No shifting, no \texttt{memmove}, no iterator invalidation
+beyond the swapped element.
+
+\begin{Verbatim}[fontsize=\small,frame=single]
+// Remove capability at index i
+caps_[i] = caps_[num_caps_ - 1];
+--num_caps_;
+\end{Verbatim}
+
+This pattern appears in every subsystem: IPC channels,
+connections, reply slots, capabilities, PPS objects,
+subscriptions, resource managers.  It is the only deletion
+strategy in the kernel.
+
+\subsection{C++23 backport}
+
+Every type above is C++23 or earlier.  \texttt{std::expected}
+is C++23.  \texttt{std::span}, \texttt{std::ranges}, designated
+initializers are C++20.  \texttt{std::array}, \texttt{std::bitset},
+\texttt{std::optional} are older still.
+
+The only C++26 dependency is \texttt{import std} and
+\texttt{export module}.  A compatibility header
+(\texttt{src/qnx\_micro\_compat.h}) is provided.  Replace
+\texttt{import} with \texttt{\#include}, wrap each module in a
+namespace --- zero logic changes.  The bare-metal discipline
+does not depend on the module system.  It depends on not
+touching the heap.
+
+%%% ===================================================================
 \section{Module reference}
 
 \begin{longtable}{llp{7cm}}
