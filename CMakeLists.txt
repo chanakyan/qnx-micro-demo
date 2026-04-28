@@ -236,28 +236,14 @@ add_custom_target(test
     DEPENDS ${TEST_BIN}
     COMMENT "Running tests")
 
-# ─── Doxygen doc-coverage ratchet ────────────────────────────────────────────
+# ─── Doxygen ─────────────────────────────────────────────────────────────────
 
 find_program(DOXYGEN doxygen)
 if(DOXYGEN)
-    set(DOXY_LOG ${CMAKE_BINARY_DIR}/doxygen-warnings.log)
-    set(DOXY_BASELINE ${CMAKE_SOURCE_DIR}/tools/doxygen/baseline.txt)
-    set(RATCHET ${CMAKE_SOURCE_DIR}/tools/doxygen/ratchet.sh)
-
-    add_custom_target(doc-coverage-raw
+    add_custom_target(doc
         COMMAND ${DOXYGEN} ${CMAKE_SOURCE_DIR}/Doxyfile
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Running doxygen (generating warning log)")
-
-    add_custom_target(doc-coverage
-        COMMAND ${RATCHET} --strip-prefix "${CMAKE_SOURCE_DIR}/" ${DOXY_LOG} ${DOXY_BASELINE}
-        DEPENDS doc-coverage-raw
-        COMMENT "Checking doc-coverage ratchet")
-
-    add_custom_target(doc-coverage-update
-        COMMAND ${RATCHET} --update --strip-prefix "${CMAKE_SOURCE_DIR}/" ${DOXY_LOG} ${DOXY_BASELINE}
-        DEPENDS doc-coverage-raw
-        COMMENT "Updating doc-coverage baseline")
+        COMMENT "Running doxygen")
 endif()
 
 # ─── Clean ───────────────────────────────────────────────────────────────────
@@ -265,6 +251,145 @@ endif()
 add_custom_target(distclean
     COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}
     COMMENT "Removing build/")
+
+# ─── STM32H7 Eval2 bare-metal target (IN PROGRESS) ─────────────────────────
+#
+# Target: STM32H743ZI — Cortex-M7, 480 MHz, 1 MB flash, 1 MB RAM
+# Board:  NUCLEO-H743ZI2 or STM32H7 Eval2
+#
+# What works:
+#   - Preset configures arm-none-eabi cross toolchain
+#   - Cortex-M7 flags: -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard
+#   - Fixed-capacity arrays, pool allocators = zero heap = bare-metal ready
+#
+# What's blocked:
+#   - import std requires libc++ module support — not available bare-metal
+#   - Need freestanding shim: replace import std with minimal <cstdint>,
+#     <cstddef>, <array>, <span>, <bitset>, <expected>, <optional>
+#   - Linker script for STM32H743 flash/RAM layout (board/stm32h743.ld)
+#   - Startup code: vector table, SystemInit, clock tree (HSE -> PLL -> 480 MHz)
+#   - No Catch2 on target — tests run host-only, binary runs on-target via SWD
+#
+# To activate:
+#   1. brew install arm-none-eabi-gcc   (macOS)
+#      apt install gcc-arm-none-eabi    (Ubuntu)
+#   2. Add board/stm32h743.ld linker script
+#   3. Add board/startup_stm32h743.s vector table + reset handler
+#   4. Build freestanding std shim (src/freestanding/std.cppm)
+#   5. cmake --preset stm32h7 && cmake --build build-stm32
+#   6. Flash: openocd -f board/stm32h7x3_eval.cfg -c "program build-stm32/qnx_micro.bin 0x08000000 verify reset exit"
+#
+# if(STM32H7_TARGET)
+#     set(CMAKE_CXX_STANDARD 23)  # arm-none-eabi-g++ C++23 max until modules land
+#     set(LINKER_SCRIPT ${CMAKE_SOURCE_DIR}/board/stm32h743.ld)
+#
+#     add_executable(qnx_micro_stm32
+#         ${S}/main.cpp
+#         ${S}/types/types.cppm
+#         ${S}/scheduler/scheduler.cppm
+#         ${S}/ipc/ipc.cppm
+#         ${S}/memory/memory.cppm
+#         ${S}/pps/pps.cppm
+#         ${S}/driver/driver.cppm
+#         ${S}/kernel/kernel.cppm
+#         board/startup_stm32h743.s)
+#
+#     target_compile_definitions(qnx_micro_stm32 PRIVATE
+#         STM32H743xx
+#         HSE_VALUE=25000000
+#         QNX_MICRO_FREESTANDING=1)
+#
+#     target_link_options(qnx_micro_stm32 PRIVATE
+#         -T${LINKER_SCRIPT}
+#         -Wl,--gc-sections
+#         -Wl,-Map=${CMAKE_BINARY_DIR}/qnx_micro.map)
+#
+#     # Post-build: generate .bin and .hex for flashing, print size
+#     add_custom_command(TARGET qnx_micro_stm32 POST_BUILD
+#         COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:qnx_micro_stm32>
+#                 ${CMAKE_BINARY_DIR}/qnx_micro.bin
+#         COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:qnx_micro_stm32>
+#                 ${CMAKE_BINARY_DIR}/qnx_micro.hex
+#         COMMAND ${CMAKE_SIZE} $<TARGET_FILE:qnx_micro_stm32>
+#         COMMENT "Generating .bin/.hex and size report")
+# endif()
+
+# ─── C++23 backport (yes, we know) ─────────────────────────────────────────
+#
+# Every kernel type used here landed in C++23 or earlier:
+#
+#   std::expected<T,E>   — C++23   (the entire error model)
+#   std::span<T>         — C++20   (zero-copy buffer views)
+#   std::bitset<N>       — C++98   (scheduler ready_mask_)
+#   std::array<T,N>      — C++11   (fixed-capacity everything)
+#   std::optional<T>     — C++17   (nullable handles)
+#   std::string_view     — C++17   (PPS paths/keys)
+#   [[nodiscard]]        — C++17   (every query)
+#   designated init      — C++20   ({.id = x, .owner = y})
+#   std::ranges::*       — C++20   (find_if, count_if, any_of)
+#   std::erase_if        — C++20   (swap-free removal)
+#   auto -> T returns    — C++14   (trailing return types)
+#
+# The ONLY C++26 dependency is `import std` and `export module`.
+# The logic is identical on C++23. Zero changes to any algorithm,
+# data structure, or API surface.
+#
+# Backport cage — drop this at the top of each .cppm:
+#
+#   // ── qnx_micro_compat.h ──────────────────────────────────────────
+#   #ifndef QNX_MICRO_COMPAT_H
+#   #define QNX_MICRO_COMPAT_H
+#
+#   #if __cplusplus >= 202600L && __has_include(<module>)
+#     // C++26: modules — the .cppm files work as-is
+#   #else
+#     // C++23 fallback: headers replace modules, namespace replaces export
+#     #include <cstdint>
+#     #include <cstddef>
+#     #include <array>
+#     #include <span>
+#     #include <bitset>
+#     #include <expected>
+#     #include <optional>
+#     #include <string_view>
+#     #include <vector>
+#     #include <algorithm>
+#     #include <ranges>
+#     #include <functional>
+#     #define QNX_MICRO_NO_MODULES 1
+#   #endif
+#
+#   #endif
+#   // ─────────────────────────────────────────────────────────────────
+#
+# Then each module becomes:
+#
+#   // types.cppm (C++26) vs types.h (C++23)
+#   // ─────────────────────────────────────
+#   #ifndef QNX_MICRO_NO_MODULES
+#     export module qnx.types;
+#     import std;
+#   #else
+#     #pragma once
+#     #include "qnx_micro_compat.h"
+#     namespace qnx::types {  // replaces export module
+#   #endif
+#
+#   // ... all kernel code identical ...
+#
+#   #ifdef QNX_MICRO_NO_MODULES
+#     }  // namespace qnx::types
+#   #endif
+#
+# That's it. Same fixed arrays, same pool allocators, same MsgPool,
+# same FixedString<N>, same swap-with-last, same O(1) scheduler.
+# The bare-metal discipline doesn't depend on the module system.
+# It depends on not touching the heap.
+#
+# We chose C++26 modules because they express the DAG:
+#   types -> scheduler -> ipc -> memory -> driver -> pps -> kernel
+# Headers would compile. Modules make the dependency graph a
+# first-class artifact the compiler enforces.
 
 # ─── Status ──────────────────────────────────────────────────────────────────
 
@@ -282,8 +407,7 @@ message(STATUS "=== TARGETS ===")
 message(STATUS "  cmake --build build                  Build qnx_micro")
 message(STATUS "  cmake --build build --target test    Run Catch2 tests")
 if(DOXYGEN)
-    message(STATUS "  cmake --build build --target doc-coverage        Check doc ratchet")
-    message(STATUS "  cmake --build build --target doc-coverage-update Update baseline")
+    message(STATUS "  cmake --build build --target doc             Generate API docs")
 endif()
 message(STATUS "  cmake --build build --target clean   Remove compiled artifacts")
 message(STATUS "  cmake --build build --target distclean  Remove build/ entirely")

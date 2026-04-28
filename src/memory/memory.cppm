@@ -16,15 +16,17 @@ export namespace qnx::memory {
 
 /// @brief Backing store ID — multiple capabilities can reference the same buffer.
 struct BufferId {
-    int value;
+    int value = -1;
+    constexpr BufferId() = default;
     constexpr explicit BufferId(int v) : value{v} {}
     constexpr auto operator<=>(const BufferId&) const = default;
 };
 
-/// @brief Actual memory buffer with reference counting.
+/// @brief Actual memory buffer with fixed backing store.
 struct SharedBuffer {
     BufferId              id;      ///< Unique buffer identity
-    std::vector<std::byte> data;   ///< The actual bytes
+    std::array<std::byte, max_msg_size> data = {};  ///< The actual bytes
+    std::size_t data_len = 0;  ///< Allocated length within data
 };
 
 // ─── Capability ────────────────────────────────────────────────────────────
@@ -50,44 +52,60 @@ struct Capability {
  * children of the revoked capability.
  */
 class MemoryManager {
-    std::vector<SharedBuffer> buffers_;
-    std::vector<Capability>   caps_;
+    std::array<SharedBuffer, max_buffers> buffers_ = {};
+    std::uint32_t num_buffers_ = 0;
+    std::array<Capability, max_capabilities> caps_ = {};
+    std::uint32_t num_caps_ = 0;
     int next_cap_id_ = 1;
     int next_buf_id_ = 1;
 
-    [[nodiscard]] auto find_cap(CapabilityId id) -> Capability* {
-        for (auto& c : caps_) {
-            if (c.id == id) return &c;
+    [[nodiscard]] auto find_cap_idx(CapabilityId id) -> int {
+        for (std::uint32_t i = 0; i < num_caps_; ++i) {
+            if (caps_[i].id == id) return static_cast<int>(i);
         }
-        return nullptr;
+        return -1;
     }
 
-    [[nodiscard]] auto find_cap(CapabilityId id) const -> const Capability* {
-        for (const auto& c : caps_) {
-            if (c.id == id) return &c;
+    [[nodiscard]] auto find_cap_idx(CapabilityId id) const -> int {
+        for (std::uint32_t i = 0; i < num_caps_; ++i) {
+            if (caps_[i].id == id) return static_cast<int>(i);
         }
-        return nullptr;
+        return -1;
     }
 
-    [[nodiscard]] auto find_buffer(BufferId id) -> SharedBuffer* {
-        for (auto& b : buffers_) {
-            if (b.id == id) return &b;
+    [[nodiscard]] auto find_buffer_idx(BufferId id) -> int {
+        for (std::uint32_t i = 0; i < num_buffers_; ++i) {
+            if (buffers_[i].id == id) return static_cast<int>(i);
         }
-        return nullptr;
+        return -1;
     }
 
-    [[nodiscard]] auto find_buffer(BufferId id) const -> const SharedBuffer* {
-        for (const auto& b : buffers_) {
-            if (b.id == id) return &b;
+    [[nodiscard]] auto find_buffer_idx(BufferId id) const -> int {
+        for (std::uint32_t i = 0; i < num_buffers_; ++i) {
+            if (buffers_[i].id == id) return static_cast<int>(i);
         }
-        return nullptr;
+        return -1;
     }
+
+    /// @brief Fixed-size buffer for collecting capability IDs during revocation.
+    struct CapIdList {
+        std::array<CapabilityId, max_capabilities> ids = {};
+        std::uint32_t count = 0;
+        auto push(CapabilityId id) -> void {
+            if (count < max_capabilities) ids[count++] = id;
+        }
+        [[nodiscard]] auto contains(CapabilityId id) const -> bool {
+            auto s = std::span{ids.data(), count};
+            return std::ranges::find(s, id) != s.end();
+        }
+    };
 
     /// @brief Collect all capability IDs that are children (direct or transitive) of a parent.
-    auto collect_children(CapabilityId parent_id, std::vector<CapabilityId>& out) const -> void {
-        for (const auto& c : caps_) {
+    auto collect_children(CapabilityId parent_id, CapIdList& out) const -> void {
+        auto s = std::span{caps_.data(), num_caps_};
+        for (const auto& c : s) {
             if (c.parent == parent_id) {
-                out.push_back(c.id);
+                out.push(c.id);
                 collect_children(c.id, out);
             }
         }
@@ -105,17 +123,25 @@ public:
      */
     [[nodiscard]] auto mmap(ProcessId pid, std::size_t length, Perm perm)
         -> Result<CapabilityId> {
+        if (num_buffers_ >= max_buffers) return std::unexpected(KernelError::no_memory);
+        if (num_caps_ >= max_capabilities) return std::unexpected(KernelError::no_memory);
+        if (length > max_msg_size) return std::unexpected(KernelError::no_memory);
+
         auto buf_id = BufferId{next_buf_id_++};
-        buffers_.push_back(SharedBuffer{
-            .id = buf_id, .data = std::vector<std::byte>(length, std::byte{0})
-        });
+        auto& buf = buffers_[num_buffers_++];
+        buf.id = buf_id;
+        buf.data = {};  // zero-fill
+        buf.data_len = length;
 
         auto cap_id = CapabilityId{next_cap_id_++};
-        caps_.push_back(Capability{
-            .id = cap_id, .owner = pid, .buffer = buf_id,
-            .offset = 0, .length = length, .perm = perm,
-            .parent = std::nullopt
-        });
+        auto& cap = caps_[num_caps_++];
+        cap.id = cap_id;
+        cap.owner = pid;
+        cap.buffer = buf_id;
+        cap.offset = 0;
+        cap.length = length;
+        cap.perm = perm;
+        cap.parent = std::nullopt;
 
         return cap_id;
     }
@@ -126,28 +152,40 @@ public:
      * @return Void on success.
      */
     [[nodiscard]] auto munmap(CapabilityId cap_id) -> VoidResult {
-        auto* cap = find_cap(cap_id);
-        if (!cap) return std::unexpected(KernelError::invalid_capability);
+        auto ci = find_cap_idx(cap_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_capability);
+        auto& cap = caps_[ci];
 
-        auto buf_id = cap->buffer;
+        auto buf_id = cap.buffer;
 
         // Revoke this and all children
-        std::vector<CapabilityId> to_remove;
-        to_remove.push_back(cap_id);
+        CapIdList to_remove;
+        to_remove.push(cap_id);
         collect_children(cap_id, to_remove);
 
-        std::erase_if(caps_, [&](const Capability& c) {
-            return std::ranges::find(to_remove, c.id) != to_remove.end();
-        });
+        // Remove matching capabilities (swap-with-last)
+        for (std::uint32_t i = 0; i < num_caps_; ) {
+            if (to_remove.contains(caps_[i].id)) {
+                caps_[i] = caps_[num_caps_ - 1];
+                --num_caps_;
+            } else {
+                ++i;
+            }
+        }
 
         // If no capabilities reference this buffer, free it
-        bool still_referenced = std::ranges::any_of(caps_, [&](const Capability& c) {
+        auto cap_span = std::span{caps_.data(), num_caps_};
+        bool still_referenced = std::ranges::any_of(cap_span, [&](const Capability& c) {
             return c.buffer == buf_id;
         });
         if (!still_referenced) {
-            std::erase_if(buffers_, [&](const SharedBuffer& b) {
-                return b.id == buf_id;
-            });
+            for (std::uint32_t i = 0; i < num_buffers_; ++i) {
+                if (buffers_[i].id == buf_id) {
+                    buffers_[i] = buffers_[num_buffers_ - 1];
+                    --num_buffers_;
+                    break;
+                }
+            }
         }
 
         return {};
@@ -173,25 +211,28 @@ public:
                                          std::size_t sub_offset = 0,
                                          std::size_t sub_length = 0)
         -> Result<CapabilityId> {
-        auto* parent = find_cap(cap_id);
-        if (!parent) return std::unexpected(KernelError::invalid_capability);
+        auto pi = find_cap_idx(cap_id);
+        if (pi < 0) return std::unexpected(KernelError::invalid_capability);
+        auto& parent = caps_[pi];
 
         // Default: same length as parent
-        if (sub_length == 0) sub_length = parent->length - sub_offset;
+        if (sub_length == 0) sub_length = parent.length - sub_offset;
 
         // Sub-region must fit within parent
-        if (sub_offset + sub_length > parent->length) {
+        if (sub_offset + sub_length > parent.length) {
             return std::unexpected(KernelError::permission_denied);
         }
 
+        if (num_caps_ >= max_capabilities) return std::unexpected(KernelError::no_memory);
         auto new_id = CapabilityId{next_cap_id_++};
-        caps_.push_back(Capability{
-            .id = new_id, .owner = target, .buffer = parent->buffer,
-            .offset = parent->offset + sub_offset,
-            .length = sub_length,
-            .perm = parent->perm & restricted,  // never escalate
-            .parent = cap_id
-        });
+        auto& c = caps_[num_caps_++];
+        c.id = new_id;
+        c.owner = target;
+        c.buffer = parent.buffer;
+        c.offset = parent.offset + sub_offset;
+        c.length = sub_length;
+        c.perm = parent.perm & restricted;  // never escalate
+        c.parent = cap_id;
 
         return new_id;
     }
@@ -202,15 +243,21 @@ public:
      * @return Void on success.
      */
     [[nodiscard]] auto capability_revoke(CapabilityId cap_id) -> VoidResult {
-        if (!find_cap(cap_id)) return std::unexpected(KernelError::invalid_capability);
+        if (find_cap_idx(cap_id) < 0) return std::unexpected(KernelError::invalid_capability);
 
-        std::vector<CapabilityId> to_remove;
-        to_remove.push_back(cap_id);
+        CapIdList to_remove;
+        to_remove.push(cap_id);
         collect_children(cap_id, to_remove);
 
-        std::erase_if(caps_, [&](const Capability& c) {
-            return std::ranges::find(to_remove, c.id) != to_remove.end();
-        });
+        // Remove matching capabilities (swap-with-last)
+        for (std::uint32_t i = 0; i < num_caps_; ) {
+            if (to_remove.contains(caps_[i].id)) {
+                caps_[i] = caps_[num_caps_ - 1];
+                --num_caps_;
+            } else {
+                ++i;
+            }
+        }
 
         return {};
     }
@@ -224,14 +271,16 @@ public:
      */
     [[nodiscard]] auto write_span(CapabilityId cap_id)
         -> Result<std::span<std::byte>> {
-        auto* cap = find_cap(cap_id);
-        if (!cap) return std::unexpected(KernelError::invalid_capability);
-        if (!has_perm(cap->perm, Perm::write)) return std::unexpected(KernelError::permission_denied);
+        auto ci = find_cap_idx(cap_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_capability);
+        auto& cap = caps_[ci];
+        if (!has_perm(cap.perm, Perm::write)) return std::unexpected(KernelError::permission_denied);
 
-        auto* buf = find_buffer(cap->buffer);
-        if (!buf) return std::unexpected(KernelError::no_memory);
+        auto bi = find_buffer_idx(cap.buffer);
+        if (bi < 0) return std::unexpected(KernelError::no_memory);
+        auto& buf = buffers_[bi];
 
-        return std::span<std::byte>{buf->data.data() + cap->offset, cap->length};
+        return std::span<std::byte>{buf.data.data() + cap.offset, std::min(cap.length, buf.data_len - cap.offset)};
     }
 
     /**
@@ -241,14 +290,16 @@ public:
      */
     [[nodiscard]] auto read_span(CapabilityId cap_id) const
         -> Result<std::span<const std::byte>> {
-        auto* cap = find_cap(cap_id);
-        if (!cap) return std::unexpected(KernelError::invalid_capability);
-        if (!has_perm(cap->perm, Perm::read)) return std::unexpected(KernelError::permission_denied);
+        auto ci = find_cap_idx(cap_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_capability);
+        auto& cap = caps_[ci];
+        if (!has_perm(cap.perm, Perm::read)) return std::unexpected(KernelError::permission_denied);
 
-        auto* buf = find_buffer(cap->buffer);
-        if (!buf) return std::unexpected(KernelError::no_memory);
+        auto bi = find_buffer_idx(cap.buffer);
+        if (bi < 0) return std::unexpected(KernelError::no_memory);
+        auto& buf = buffers_[bi];
 
-        return std::span<const std::byte>{buf->data.data() + cap->offset, cap->length};
+        return std::span<const std::byte>{buf.data.data() + cap.offset, std::min(cap.length, buf.data_len - cap.offset)};
     }
 
     // ─── Queries ───────────────────────────────────────────────────────────
@@ -262,28 +313,28 @@ public:
      */
     [[nodiscard]] auto check_access(ProcessId pid, CapabilityId cap_id, Perm required) const
         -> bool {
-        auto* cap = find_cap(cap_id);
-        return cap && cap->owner == pid && has_perm(cap->perm, required);
+        auto ci = find_cap_idx(cap_id);
+        return ci >= 0 && caps_[ci].owner == pid && has_perm(caps_[ci].perm, required);
     }
 
     /// @brief Number of active capabilities.
-    [[nodiscard]] auto capability_count() const -> std::size_t { return caps_.size(); }
+    [[nodiscard]] auto capability_count() const -> std::size_t { return num_caps_; }
 
     /// @brief Number of active buffers.
-    [[nodiscard]] auto buffer_count() const -> std::size_t { return buffers_.size(); }
+    [[nodiscard]] auto buffer_count() const -> std::size_t { return num_buffers_; }
 
     /// @brief Get the permissions of a capability.
     [[nodiscard]] auto get_perm(CapabilityId cap_id) const -> Result<Perm> {
-        auto* cap = find_cap(cap_id);
-        if (!cap) return std::unexpected(KernelError::invalid_capability);
-        return cap->perm;
+        auto ci = find_cap_idx(cap_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_capability);
+        return caps_[ci].perm;
     }
 
     /// @brief Get the parent of a capability (nullopt if root).
     [[nodiscard]] auto get_parent(CapabilityId cap_id) const -> Result<std::optional<CapabilityId>> {
-        auto* cap = find_cap(cap_id);
-        if (!cap) return std::unexpected(KernelError::invalid_capability);
-        return cap->parent;
+        auto ci = find_cap_idx(cap_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_capability);
+        return caps_[ci].parent;
     }
 };
 

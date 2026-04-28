@@ -1,0 +1,80 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "llvm",
+      "displayName": "Homebrew LLVM (macOS)",
+      "description": "macOS with Homebrew upstream LLVM clang/clang++",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "environment": {
+        "HOMEBREW_PREFIX": "/opt/homebrew"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++"
+      }
+    },
+    {
+      "name": "linux",
+      "displayName": "LLVM (Linux / WSL / Docker)",
+      "description": "Linux, WSL 2, or Docker with system LLVM clang/clang++",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/usr/bin/clang",
+        "CMAKE_CXX_COMPILER": "/usr/bin/clang++"
+      }
+    },
+    {
+      "name": "linux-opt",
+      "displayName": "LLVM /opt (Linux / WSL / Docker)",
+      "description": "Linux with LLVM installed to /opt/llvm (apt.llvm.org or manual)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/usr/lib/llvm-22/bin/clang",
+        "CMAKE_CXX_COMPILER": "/usr/lib/llvm-22/bin/clang++"
+      }
+    },
+    {
+      "name": "stm32h7",
+      "displayName": "[WIP] STM32H7 Eval2 (Cortex-M7, bare-metal)",
+      "description": "IN PROGRESS — Cross-compile for STM32H743/H750 NUCLEO-H743ZI2 or STM32H7 Eval2. Requires arm-none-eabi toolchain. import std not yet available bare-metal; freestanding subset only.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-stm32",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Generic",
+        "CMAKE_SYSTEM_PROCESSOR": "arm",
+        "CMAKE_C_COMPILER": "arm-none-eabi-gcc",
+        "CMAKE_CXX_COMPILER": "arm-none-eabi-g++",
+        "CMAKE_ASM_COMPILER": "arm-none-eabi-gcc",
+        "CMAKE_OBJCOPY": "arm-none-eabi-objcopy",
+        "CMAKE_OBJDUMP": "arm-none-eabi-objdump",
+        "CMAKE_SIZE": "arm-none-eabi-size",
+        "STM32H7_TARGET": "ON",
+        "CMAKE_C_FLAGS": "-mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -ffunction-sections -fdata-sections -DSTM32H743xx",
+        "CMAKE_CXX_FLAGS": "-mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -DSTM32H743xx",
+        "CMAKE_EXE_LINKER_FLAGS": "-mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -Wl,--gc-sections -specs=nosys.specs -specs=nano.specs"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "llvm",
+      "configurePreset": "llvm"
+    },
+    {
+      "name": "linux",
+      "configurePreset": "linux"
+    },
+    {
+      "name": "linux-opt",
+      "configurePreset": "linux-opt"
+    },
+    {
+      "name": "stm32h7",
+      "configurePreset": "stm32h7"
+    }
+  ]
+}

@@ -19,15 +19,17 @@ export namespace qnx::ipc {
 struct PendingMessage {
     ThreadId      sender;  ///< Thread that called MsgSend
     ConnectionId  conn;    ///< Connection the message arrived on
-    std::vector<std::byte> data;  ///< Message payload bytes
+    MsgSlotId     data_slot;  ///< Index into the message pool
 };
 
 /** @brief Server-side IPC endpoint that receives messages and pulses. */
 struct Channel {
     ChannelId   id;      ///< Unique channel handle
     ProcessId   owner;   ///< Process that created this channel
-    std::vector<PendingMessage> send_queue;   ///< Senders waiting for server to receive
-    std::vector<Pulse>          pulse_queue;  ///< Queued async pulses
+    std::array<PendingMessage, max_send_queue> send_queue = {};  ///< Senders waiting for server to receive
+    std::uint32_t num_send = 0;  ///< Number of pending messages
+    std::array<Pulse, max_pulse_queue> pulse_queue = {};  ///< Queued async pulses
+    std::uint32_t num_pulses = 0;  ///< Number of queued pulses
     std::optional<ThreadId>     receiver;     ///< Server thread blocked on MsgReceive, if any
 };
 
@@ -45,8 +47,8 @@ struct Connection {
 /** @brief Tracks a pending reply for a sender blocked in reply_blocked state. */
 struct ReplySlot {
     ThreadId sender;                ///< Thread awaiting the reply
-    std::vector<std::byte> reply_data;  ///< Reply payload (filled by MsgReply)
-    bool replied;                   ///< True once server has called MsgReply
+    MsgSlotId reply_slot;           ///< Index into pool for reply payload (filled by MsgReply)
+    bool replied = false;           ///< True once server has called MsgReply
 };
 
 // ─── IPC subsystem ─────────────────────────────────────────────────────────
@@ -59,32 +61,30 @@ struct ReplySlot {
  * provide an asynchronous non-blocking notification path.
  */
 class Ipc {
-    std::vector<Channel>    channels_;
-    std::vector<Connection> connections_;
-    std::vector<ReplySlot>  reply_slots_;
+    std::array<Channel, max_channels>       channels_ = {};
+    std::uint32_t num_channels_ = 0;
+    std::array<Connection, max_connections>  connections_ = {};
+    std::uint32_t num_connections_ = 0;
+    std::array<ReplySlot, max_reply_slots>  reply_slots_ = {};
+    std::uint32_t num_reply_slots_ = 0;
+    MsgPool msg_pool_;
     int next_ch_id_   = 1;
     int next_conn_id_ = 1;
     scheduler::Scheduler* sched_;
 
-    [[nodiscard]] auto find_channel(ChannelId id) -> Channel* {
-        for (auto& ch : channels_) {
-            if (ch.id == id) return &ch;
-        }
-        return nullptr;
+    [[nodiscard]] auto find_channel_idx(ChannelId id) -> int {
+        for (int i = 0; i < num_channels_; ++i) { if (channels_[i].id == id) return i; }
+        return -1;
     }
 
-    [[nodiscard]] auto find_connection(ConnectionId id) -> Connection* {
-        for (auto& c : connections_) {
-            if (c.id == id) return &c;
-        }
-        return nullptr;
+    [[nodiscard]] auto find_connection_idx(ConnectionId id) -> int {
+        for (int i = 0; i < num_connections_; ++i) { if (connections_[i].id == id) return i; }
+        return -1;
     }
 
-    [[nodiscard]] auto find_reply_slot(ThreadId sender) -> ReplySlot* {
-        for (auto& rs : reply_slots_) {
-            if (rs.sender == sender && !rs.replied) return &rs;
-        }
-        return nullptr;
+    [[nodiscard]] auto find_reply_slot_idx(ThreadId sender) -> int {
+        for (int i = 0; i < num_reply_slots_; ++i) { if (reply_slots_[i].sender == sender && !reply_slots_[i].replied) return i; }
+        return -1;
     }
 
 public:
@@ -97,7 +97,8 @@ public:
     /// @brief Compute max priority among all senders waiting on a channel.
     [[nodiscard]] auto max_waiter_priority(const Channel& ch) const -> Priority {
         int max_pri = 0;
-        for (const auto& msg : ch.send_queue) {
+        auto s = std::span{ch.send_queue.data(), ch.num_send};
+        for (const auto& msg : s) {
             auto pri = sched_->get_priority(msg.sender);
             if (pri && pri->value > max_pri) max_pri = pri->value;
         }
@@ -109,8 +110,6 @@ public:
         if (ch.receiver) {
             (void)sched_->on_queue_change(*ch.receiver, max_waiter_priority(ch));
         }
-        // Also boost the channel owner if it's running/ready
-        // The owner thread is whoever calls MsgReceive — tracked by ch.receiver
     }
 
     // ─── Channel create / connect ──────────────────────────────────────────
@@ -121,12 +120,14 @@ public:
      * @return ChannelId of the newly created channel.
      */
     [[nodiscard]] auto channel_create(ProcessId owner) -> Result<ChannelId> {
+        if (num_channels_ >= max_channels) return std::unexpected(KernelError::no_memory);
         auto id = ChannelId{next_ch_id_++};
-        channels_.push_back(Channel{
-            .id = id, .owner = owner,
-            .send_queue = {}, .pulse_queue = {},
-            .receiver = std::nullopt
-        });
+        auto& ch = channels_[num_channels_++];
+        ch.id = id;
+        ch.owner = owner;
+        ch.num_send = 0;
+        ch.num_pulses = 0;
+        ch.receiver = std::nullopt;
         return id;
     }
 
@@ -137,11 +138,13 @@ public:
      * @return ConnectionId on success, KernelError::invalid_channel if channel not found.
      */
     [[nodiscard]] auto connect_attach(ChannelId ch, ProcessId pid) -> Result<ConnectionId> {
-        if (!find_channel(ch)) return std::unexpected(KernelError::invalid_channel);
+        if (find_channel_idx(ch) < 0) return std::unexpected(KernelError::invalid_channel);
+        if (num_connections_ >= max_connections) return std::unexpected(KernelError::no_memory);
         auto id = ConnectionId{next_conn_id_++};
-        connections_.push_back(Connection{
-            .id = id, .channel = ch, .client_pid = pid
-        });
+        auto& c = connections_[num_connections_++];
+        c.id = id;
+        c.channel = ch;
+        c.client_pid = pid;
         return id;
     }
 
@@ -163,31 +166,43 @@ public:
      */
     [[nodiscard]] auto msg_send(ThreadId sender, ConnectionId conn_id,
                                  std::span<const std::byte> data) -> VoidResult {
-        auto* conn = find_connection(conn_id);
-        if (!conn) return std::unexpected(KernelError::invalid_connection);
+        auto ci = find_connection_idx(conn_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_connection);
+        const auto& conn = connections_[ci];
 
-        auto* ch = find_channel(conn->channel);
-        if (!ch) return std::unexpected(KernelError::invalid_channel);
+        auto chi = find_channel_idx(conn.channel);
+        if (chi < 0) return std::unexpected(KernelError::invalid_channel);
+        auto& ch = channels_[chi];
+
+        // Allocate pool slot for message data
+        auto data_slot = msg_pool_.alloc();
+        if (!data_slot.valid()) return std::unexpected(KernelError::no_memory);
+        msg_pool_.at(data_slot) = MsgBuffer{data};
 
         // Enqueue message
-        auto msg = PendingMessage{
-            .sender = sender, .conn = conn_id,
-            .data = std::vector<std::byte>(data.begin(), data.end())
-        };
+        PendingMessage msg;
+        msg.sender = sender;
+        msg.conn = conn_id;
+        msg.data_slot = data_slot;
 
         // Create reply slot for this sender
-        reply_slots_.push_back(ReplySlot{
-            .sender = sender, .reply_data = {}, .replied = false
-        });
+        if (num_reply_slots_ >= max_reply_slots) {
+            msg_pool_.free(data_slot);
+            return std::unexpected(KernelError::no_memory);
+        }
+        auto& slot = reply_slots_[num_reply_slots_++];
+        slot.sender = sender;
+        slot.reply_slot = MsgSlotId{};  // no reply data yet
+        slot.replied = false;
 
         // Block sender
         auto br = sched_->thread_block(sender, ThreadState::send_blocked);
         if (!br) return std::unexpected(br.error());
 
         // If server is waiting, deliver immediately
-        if (ch->receiver) {
-            auto server_tid = *ch->receiver;
-            ch->receiver = std::nullopt;
+        if (ch.receiver) {
+            auto server_tid = *ch.receiver;
+            ch.receiver = std::nullopt;
 
             // Move sender to reply_blocked (server now has the message)
             (void)sched_->thread_block(sender, ThreadState::reply_blocked);
@@ -196,13 +211,13 @@ public:
             (void)sched_->thread_unblock(server_tid);
 
             // Message goes directly to server (stored in channel for pickup)
-            ch->send_queue.push_back(std::move(msg));
+            if (ch.num_send < max_send_queue) ch.send_queue[ch.num_send++] = msg;
         } else {
-            ch->send_queue.push_back(std::move(msg));
+            if (ch.num_send < max_send_queue) ch.send_queue[ch.num_send++] = msg;
         }
 
         // Priority inheritance: boost server to max waiter priority
-        notify_queue_change(*ch);
+        notify_queue_change(ch);
 
         return {};
     }
@@ -215,7 +230,7 @@ public:
     struct ReceivedMessage {
         ConnectionId conn;    ///< Connection the message arrived on
         ThreadId     sender;  ///< Sending thread (needed for MsgReply)
-        std::vector<std::byte> data;  ///< Message payload bytes
+        MsgBuffer    data;    ///< Message payload bytes (copied from pool)
     };
 
     /**
@@ -230,28 +245,36 @@ public:
      */
     [[nodiscard]] auto msg_receive(ThreadId receiver, ChannelId ch_id)
         -> Result<ReceivedMessage> {
-        auto* ch = find_channel(ch_id);
-        if (!ch) return std::unexpected(KernelError::invalid_channel);
+        auto chi = find_channel_idx(ch_id);
+        if (chi < 0) return std::unexpected(KernelError::invalid_channel);
+        auto& ch = channels_[chi];
 
         // Check pulse queue first (async, non-blocking delivery)
         // Pulses are returned as zero-length messages with pulse info
         // (simplified: skip pulses for now, handle messages)
 
-        if (!ch->send_queue.empty()) {
-            auto msg = std::move(ch->send_queue.front());
-            ch->send_queue.erase(ch->send_queue.begin());
+        if (ch.num_send > 0) {
+            auto msg = ch.send_queue[0];
+            // Shift remaining (FIFO)
+            for (std::uint32_t i = 0; i + 1 < ch.num_send; ++i) {
+                ch.send_queue[i] = ch.send_queue[i + 1];
+            }
+            --ch.num_send;
 
             // Sender transitions: send_blocked -> reply_blocked
             (void)sched_->thread_block(msg.sender, ThreadState::reply_blocked);
 
-            return ReceivedMessage{
-                .conn = msg.conn, .sender = msg.sender,
-                .data = std::move(msg.data)
-            };
+            ReceivedMessage rm;
+            rm.conn = msg.conn;
+            rm.sender = msg.sender;
+            // Copy data from pool, then free the send slot
+            if (msg.data_slot.valid()) rm.data = msg_pool_.at(msg.data_slot);
+            msg_pool_.free(msg.data_slot);
+            return rm;
         }
 
         // No messages waiting — block server
-        ch->receiver = receiver;
+        ch.receiver = receiver;
         (void)sched_->thread_block(receiver, ThreadState::receive_blocked);
         return std::unexpected(KernelError::would_block);
     }
@@ -267,22 +290,32 @@ public:
      */
     [[nodiscard]] auto msg_reply(ThreadId sender, std::span<const std::byte> data)
         -> VoidResult {
-        auto* slot = find_reply_slot(sender);
-        if (!slot) return std::unexpected(KernelError::invalid_thread);
+        auto si = find_reply_slot_idx(sender);
+        if (si < 0) return std::unexpected(KernelError::invalid_thread);
 
-        slot->reply_data = std::vector<std::byte>(data.begin(), data.end());
-        slot->replied = true;
+        // Allocate pool slot for reply data
+        auto reply_data_slot = msg_pool_.alloc();
+        if (!reply_data_slot.valid()) return std::unexpected(KernelError::no_memory);
+        msg_pool_.at(reply_data_slot) = MsgBuffer{data};
+        reply_slots_[si].reply_slot = reply_data_slot;
+        reply_slots_[si].replied = true;
 
         // Unblock sender
         auto r = sched_->thread_unblock(sender);
 
-        // Clean up reply slot — don't leak
-        std::erase_if(reply_slots_, [&](const ReplySlot& rs) {
-            return rs.sender == sender && rs.replied;
-        });
+        // Clean up reply slot — free pool slot, swap with last, decrement count
+        for (std::uint32_t i = 0; i < num_reply_slots_; ++i) {
+            if (reply_slots_[i].sender == sender && reply_slots_[i].replied) {
+                msg_pool_.free(reply_slots_[i].reply_slot);
+                reply_slots_[i] = reply_slots_[num_reply_slots_ - 1];
+                --num_reply_slots_;
+                break;
+            }
+        }
 
         // Priority inheritance: server priority may drop now that a waiter left.
-        for (auto& ch : channels_) {
+        auto chs = std::span{channels_.data(), num_channels_};
+        for (auto& ch : chs) {
             notify_queue_change(ch);
         }
 
@@ -303,18 +336,21 @@ public:
      */
     [[nodiscard]] auto msg_send_pulse(ConnectionId conn_id, Pulse pulse)
         -> VoidResult {
-        auto* conn = find_connection(conn_id);
-        if (!conn) return std::unexpected(KernelError::invalid_connection);
+        auto ci = find_connection_idx(conn_id);
+        if (ci < 0) return std::unexpected(KernelError::invalid_connection);
+        const auto& conn = connections_[ci];
 
-        auto* ch = find_channel(conn->channel);
-        if (!ch) return std::unexpected(KernelError::invalid_channel);
+        auto chi = find_channel_idx(conn.channel);
+        if (chi < 0) return std::unexpected(KernelError::invalid_channel);
+        auto& ch = channels_[chi];
 
-        ch->pulse_queue.push_back(pulse);
+        if (ch.num_pulses >= max_pulse_queue) return std::unexpected(KernelError::channel_full);
+        ch.pulse_queue[ch.num_pulses++] = pulse;
 
         // If server is receive-blocked, unblock it
-        if (ch->receiver) {
-            auto server_tid = *ch->receiver;
-            ch->receiver = std::nullopt;
+        if (ch.receiver) {
+            auto server_tid = *ch.receiver;
+            ch.receiver = std::nullopt;
             (void)sched_->thread_unblock(server_tid);
         }
 
@@ -327,13 +363,13 @@ public:
      * @brief Number of active channels.
      * @return Channel count.
      */
-    [[nodiscard]] auto channel_count() const -> std::size_t { return channels_.size(); }
+    [[nodiscard]] auto channel_count() const -> std::size_t { return num_channels_; }
 
     /**
      * @brief Number of active connections.
      * @return Connection count.
      */
-    [[nodiscard]] auto connection_count() const -> std::size_t { return connections_.size(); }
+    [[nodiscard]] auto connection_count() const -> std::size_t { return num_connections_; }
 
     /**
      * @brief Retrieve the reply data for a completed MsgReply.
@@ -341,9 +377,11 @@ public:
      * @return Span of reply bytes if replied, nullopt if still pending.
      */
     [[nodiscard]] auto get_reply(ThreadId sender) const -> std::optional<std::span<const std::byte>> {
-        for (const auto& rs : reply_slots_) {
-            if (rs.sender == sender && rs.replied) {
-                return std::span<const std::byte>(rs.reply_data);
+        for (int i = 0; i < num_reply_slots_; ++i) {
+            const auto& rs = reply_slots_[i];
+            if (rs.sender == sender && rs.replied && rs.reply_slot.valid()) {
+                const auto& buf = msg_pool_.at(rs.reply_slot);
+                return std::span<const std::byte>(buf);
             }
         }
         return std::nullopt;

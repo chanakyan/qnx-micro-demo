@@ -14,9 +14,19 @@ export namespace qnx::driver {
 
 /** @brief A registered resource manager binding a pathname to an IPC channel. */
 struct ResourceManager {
-    std::string   path;     ///< Pathname prefix this resource manager handles (e.g. "/dev/ser1")
+    std::array<char, max_path_len> path = {};  ///< Pathname prefix (e.g. "/dev/ser1")
+    std::size_t path_len = 0;  ///< Actual path length
     ChannelId     channel;  ///< IPC channel where this manager receives messages
     ProcessId     pid;      ///< Process hosting this resource manager
+
+    [[nodiscard]] auto path_view() const -> std::string_view {
+        return {path.data(), path_len};
+    }
+    void set_path(std::string_view p) {
+        path_len = std::min(p.size(), max_path_len - 1);
+        std::copy_n(p.data(), path_len, path.data());
+        path[path_len] = '\0';
+    }
 };
 
 /**
@@ -27,7 +37,8 @@ struct ResourceManager {
  * appropriate channel, then creates a connection for the client.
  */
 class Namespace {
-    std::vector<ResourceManager> entries_;
+    std::array<ResourceManager, max_resource_managers> entries_ = {};
+    std::uint32_t num_entries_ = 0;
     ipc::Ipc* ipc_;
 
 public:
@@ -47,12 +58,15 @@ public:
     [[nodiscard]] auto register_resource(std::string_view path, ChannelId ch, ProcessId pid)
         -> VoidResult {
         // Check for duplicate
-        for (const auto& e : entries_) {
-            if (e.path == path) return std::unexpected(KernelError::already_exists);
+        auto s = std::span{entries_.data(), num_entries_};
+        for (const auto& e : s) {
+            if (e.path_view() == path) return std::unexpected(KernelError::already_exists);
         }
-        entries_.push_back(ResourceManager{
-            .path = std::string(path), .channel = ch, .pid = pid
-        });
+        if (num_entries_ >= max_resource_managers) return std::unexpected(KernelError::no_memory);
+        auto& entry = entries_[num_entries_++];
+        entry.set_path(path);
+        entry.channel = ch;
+        entry.pid = pid;
         return {};
     }
 
@@ -62,12 +76,14 @@ public:
      * @return Void on success, KernelError::not_found if path not registered.
      */
     [[nodiscard]] auto unregister_resource(std::string_view path) -> VoidResult {
-        auto it = std::ranges::find_if(entries_, [&](const ResourceManager& rm) {
-            return rm.path == path;
-        });
-        if (it == entries_.end()) return std::unexpected(KernelError::not_found);
-        entries_.erase(it);
-        return {};
+        for (std::uint32_t i = 0; i < num_entries_; ++i) {
+            if (entries_[i].path_view() == path) {
+                entries_[i] = entries_[num_entries_ - 1];
+                --num_entries_;
+                return {};
+            }
+        }
+        return std::unexpected(KernelError::not_found);
     }
 
     /**
@@ -82,9 +98,10 @@ public:
         -> Result<ChannelId> {
         // Longest prefix match
         const ResourceManager* best = nullptr;
-        for (const auto& e : entries_) {
-            if (path.starts_with(e.path)) {
-                if (!best || e.path.size() > best->path.size()) {
+        auto s = std::span{entries_.data(), num_entries_};
+        for (const auto& e : s) {
+            if (path.starts_with(e.path_view())) {
+                if (!best || e.path_len > best->path_len) {
                     best = &e;
                 }
             }
@@ -110,7 +127,7 @@ public:
      * @brief Number of registered resource managers.
      * @return Entry count.
      */
-    [[nodiscard]] auto count() const -> std::size_t { return entries_.size(); }
+    [[nodiscard]] auto count() const -> std::size_t { return num_entries_; }
 };
 
 } // namespace qnx::driver

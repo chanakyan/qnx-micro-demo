@@ -18,29 +18,60 @@ export namespace qnx::pps {
 
 /** @brief Unique PPS object identifier. */
 struct ObjectId {
-    int value;  ///< Raw numeric object handle
+    int value = -1;  ///< Raw numeric object handle
+    constexpr ObjectId() = default;
     constexpr explicit ObjectId(int v) : value{v} {}
     constexpr auto operator<=>(const ObjectId&) const = default;
 };
 
 /** @brief Unique subscription handle for change notifications. */
 struct SubscriptionId {
-    int value;  ///< Raw numeric subscription handle
+    int value = -1;  ///< Raw numeric subscription handle
+    constexpr SubscriptionId() = default;
     constexpr explicit SubscriptionId(int v) : value{v} {}
     constexpr auto operator<=>(const SubscriptionId&) const = default;
 };
 
+/// @brief Fixed-capacity string type for kernel use (no heap).
+template<std::size_t N>
+struct FixedString {
+    std::array<char, N> storage = {};
+    std::size_t len = 0;
+
+    constexpr FixedString() = default;
+
+    FixedString(std::string_view sv) : len{std::min(sv.size(), N - 1)} {
+        std::copy_n(sv.data(), len, storage.data());
+        storage[len] = '\0';
+    }
+
+    [[nodiscard]] auto view() const -> std::string_view { return {storage.data(), len}; }
+    [[nodiscard]] auto size() const -> std::size_t { return len; }
+    [[nodiscard]] auto c_str() const -> const char* { return storage.data(); }
+
+    /// @brief Implicit conversion to string_view.
+    operator std::string_view() const { return view(); }
+
+    auto operator==(std::string_view sv) const -> bool { return view() == sv; }
+    auto operator==(const FixedString& o) const -> bool { return view() == o.view(); }
+
+    /// @brief Check if this string starts with a prefix.
+    [[nodiscard]] auto starts_with(std::string_view prefix) const -> bool {
+        return view().starts_with(prefix);
+    }
+};
+
 /** @brief A single key-value attribute within a PPS object. */
 struct Attribute {
-    std::string key;    ///< Attribute name
-    std::string value;  ///< Attribute value (string-encoded)
+    FixedString<max_name_len>      key;    ///< Attribute name
+    FixedString<max_pps_value_len> value;  ///< Attribute value (string-encoded)
 };
 
 /** @brief Change notification delivered to PPS subscribers. */
 struct Notification {
-    std::string path;   ///< PPS object path that changed
-    std::string key;    ///< Attribute key that was affected
-    std::string value;  ///< New value (or last value on deletion)
+    FixedString<max_path_len>      path;   ///< PPS object path that changed
+    FixedString<max_name_len>      key;    ///< Attribute key that was affected
+    FixedString<max_pps_value_len> value;  ///< New value (or last value on deletion)
     /** @brief Type of change that triggered this notification. */
     enum class Kind {
         created,   ///< New attribute added to the object
@@ -59,19 +90,20 @@ using NotifyFn = std::function<void(const Notification&)>;
 /** @brief A named PPS object containing key-value attributes. */
 struct Object {
     ObjectId    id;          ///< Unique object handle
-    std::string path;        ///< Fully qualified PPS path (e.g. "/pps/system/battery")
-    std::vector<Attribute> attrs;  ///< Current attribute set
-    bool persistent;         ///< If true, survives restart via backing store
+    FixedString<max_path_len> path;  ///< Fully qualified PPS path (e.g. "/pps/system/battery")
+    std::array<Attribute, max_pps_attrs> attrs = {};  ///< Current attribute set
+    std::uint32_t num_attrs = 0;  ///< Number of active attributes
+    bool persistent = false;       ///< If true, survives restart via backing store
 };
 
 // ─── Subscription ──────────────────────────────────────────────────────────
 
 /** @brief A subscription to change notifications under a PPS path prefix. */
 struct Subscription {
-    SubscriptionId id;              ///< Unique subscription handle
-    std::string    path_prefix;     ///< Path prefix filter (e.g. "/pps/system/")
-    ProcessId      subscriber;      ///< Process that registered this subscription
-    NotifyFn       callback;        ///< Invoked on each matching change
+    SubscriptionId id;                        ///< Unique subscription handle
+    FixedString<max_path_len> path_prefix;    ///< Path prefix filter (e.g. "/pps/system/")
+    ProcessId      subscriber;                ///< Process that registered this subscription
+    NotifyFn       callback;                  ///< Invoked on each matching change
 };
 
 // ─── PPS subsystem ─────────────────────────────────────────────────────────
@@ -84,21 +116,26 @@ struct Subscription {
  * marked persistent survive process restarts.
  */
 class Pps {
-    std::vector<Object>       objects_;
-    std::vector<Subscription> subscriptions_;
+    std::array<Object, max_pps_objects>         objects_ = {};
+    std::uint32_t num_objects_ = 0;
+    std::array<Subscription, max_subscriptions> subscriptions_ = {};
+    std::uint32_t num_subscriptions_ = 0;
     int next_obj_id_ = 1;
     int next_sub_id_ = 1;
 
-    [[nodiscard]] auto find_object(std::string_view path) -> Object* {
-        for (auto& o : objects_) {
-            if (o.path == path) return &o;
+    [[nodiscard]] auto find_object_idx(std::string_view path) -> int {
+        for (std::uint32_t i = 0; i < num_objects_; ++i) {
+            if (objects_[i].path == path) return static_cast<int>(i);
         }
-        return nullptr;
+        return -1;
     }
 
     auto notify(const Notification& n) -> void {
-        for (const auto& sub : subscriptions_) {
-            if (n.path.starts_with(sub.path_prefix) || n.path == sub.path_prefix) {
+        auto s = std::span{subscriptions_.data(), num_subscriptions_};
+        for (const auto& sub : s) {
+            auto npath = n.path.view();
+            auto prefix = sub.path_prefix.view();
+            if (npath.starts_with(prefix) || npath == prefix) {
                 sub.callback(n);
             }
         }
@@ -115,12 +152,14 @@ public:
      */
     [[nodiscard]] auto create_object(std::string_view path, bool persistent = true)
         -> Result<ObjectId> {
-        if (find_object(path)) return std::unexpected(KernelError::already_exists);
+        if (find_object_idx(path) >= 0) return std::unexpected(KernelError::already_exists);
+        if (num_objects_ >= max_pps_objects) return std::unexpected(KernelError::no_memory);
         auto id = ObjectId{next_obj_id_++};
-        objects_.push_back(Object{
-            .id = id, .path = std::string(path),
-            .attrs = {}, .persistent = persistent
-        });
+        auto& obj = objects_[num_objects_++];
+        obj.id = id;
+        obj.path = FixedString<max_path_len>{path};
+        obj.num_attrs = 0;
+        obj.persistent = persistent;
         return id;
     }
 
@@ -130,20 +169,32 @@ public:
      * @return Void on success, KernelError::not_found if object does not exist.
      */
     [[nodiscard]] auto delete_object(std::string_view path) -> VoidResult {
-        auto it = std::ranges::find_if(objects_, [&](const Object& o) {
-            return o.path == path;
-        });
-        if (it == objects_.end()) return std::unexpected(KernelError::not_found);
+        auto s = std::span{objects_.data(), num_objects_};
+        Object* found = nullptr;
+        std::uint32_t found_idx = 0;
+        for (std::uint32_t i = 0; i < num_objects_; ++i) {
+            if (objects_[i].path == path) {
+                found = &objects_[i];
+                found_idx = i;
+                break;
+            }
+        }
+        if (!found) return std::unexpected(KernelError::not_found);
 
         // Notify subscribers of deletion
-        for (const auto& attr : it->attrs) {
-            notify(Notification{
-                .path = it->path, .key = attr.key, .value = attr.value,
-                .kind = Notification::Kind::deleted
-            });
+        auto attrs = std::span{found->attrs.data(), found->num_attrs};
+        for (const auto& attr : attrs) {
+            Notification n;
+            n.path = found->path;
+            n.key = attr.key;
+            n.value = attr.value;
+            n.kind = Notification::Kind::deleted;
+            notify(n);
         }
 
-        objects_.erase(it);
+        // Swap with last, decrement
+        objects_[found_idx] = objects_[num_objects_ - 1];
+        --num_objects_;
         return {};
     }
 
@@ -161,33 +212,39 @@ public:
      */
     [[nodiscard]] auto publish(std::string_view path, std::string_view key,
                                 std::string_view value) -> VoidResult {
-        auto* obj = find_object(path);
-        if (!obj) {
+        auto oi = find_object_idx(path);
+        if (oi < 0) {
             // Auto-create object on first publish
             auto r = create_object(path);
             if (!r) return std::unexpected(r.error());
-            obj = find_object(path);
+            oi = find_object_idx(path);
         }
+        auto& obj = objects_[oi];
 
         // Find existing attribute or create new
-        auto it = std::ranges::find_if(obj->attrs, [&](const Attribute& a) {
-            return a.key == key;
-        });
+        auto attr_span = std::span{obj.attrs.data(), obj.num_attrs};
+        Attribute* found_attr = nullptr;
+        for (auto& a : attr_span) {
+            if (a.key == key) { found_attr = &a; break; }
+        }
 
         auto kind = Notification::Kind::modified;
-        if (it != obj->attrs.end()) {
-            it->value = std::string(value);
+        if (found_attr) {
+            found_attr->value = FixedString<max_pps_value_len>{value};
         } else {
-            obj->attrs.push_back(Attribute{
-                .key = std::string(key), .value = std::string(value)
-            });
+            if (obj.num_attrs >= max_pps_attrs) return std::unexpected(KernelError::no_memory);
+            auto& a = obj.attrs[obj.num_attrs++];
+            a.key = FixedString<max_name_len>{key};
+            a.value = FixedString<max_pps_value_len>{value};
             kind = Notification::Kind::created;
         }
 
-        notify(Notification{
-            .path = std::string(path), .key = std::string(key),
-            .value = std::string(value), .kind = kind
-        });
+        Notification n;
+        n.path = FixedString<max_path_len>{path};
+        n.key = FixedString<max_name_len>{key};
+        n.value = FixedString<max_pps_value_len>{value};
+        n.kind = kind;
+        notify(n);
 
         return {};
     }
@@ -202,10 +259,12 @@ public:
      */
     [[nodiscard]] auto read(std::string_view path, std::string_view key) const
         -> Result<std::string_view> {
-        for (const auto& o : objects_) {
+        auto s = std::span{objects_.data(), num_objects_};
+        for (const auto& o : s) {
             if (o.path == path) {
-                for (const auto& a : o.attrs) {
-                    if (a.key == key) return std::string_view{a.value};
+                auto attrs = std::span{o.attrs.data(), o.num_attrs};
+                for (const auto& a : attrs) {
+                    if (a.key == key) return a.value.view();
                 }
                 return std::unexpected(KernelError::not_found);
             }
@@ -222,8 +281,9 @@ public:
      */
     [[nodiscard]] auto read_object(std::string_view path) const
         -> Result<std::span<const Attribute>> {
-        for (const auto& o : objects_) {
-            if (o.path == path) return std::span<const Attribute>{o.attrs};
+        auto s = std::span{objects_.data(), num_objects_};
+        for (const auto& o : s) {
+            if (o.path == path) return std::span<const Attribute>{o.attrs.data(), o.num_attrs};
         }
         return std::unexpected(KernelError::not_found);
     }
@@ -239,11 +299,13 @@ public:
      */
     [[nodiscard]] auto subscribe(std::string_view path_prefix, ProcessId pid,
                                   NotifyFn callback) -> Result<SubscriptionId> {
+        if (num_subscriptions_ >= max_subscriptions) return std::unexpected(KernelError::no_memory);
         auto id = SubscriptionId{next_sub_id_++};
-        subscriptions_.push_back(Subscription{
-            .id = id, .path_prefix = std::string(path_prefix),
-            .subscriber = pid, .callback = std::move(callback)
-        });
+        auto& sub = subscriptions_[num_subscriptions_++];
+        sub.id = id;
+        sub.path_prefix = FixedString<max_path_len>{path_prefix};
+        sub.subscriber = pid;
+        sub.callback = std::move(callback);
         return id;
     }
 
@@ -253,12 +315,14 @@ public:
      * @return Void on success, KernelError::not_found if subscription does not exist.
      */
     [[nodiscard]] auto unsubscribe(SubscriptionId id) -> VoidResult {
-        auto it = std::ranges::find_if(subscriptions_, [&](const Subscription& s) {
-            return s.id == id;
-        });
-        if (it == subscriptions_.end()) return std::unexpected(KernelError::not_found);
-        subscriptions_.erase(it);
-        return {};
+        for (std::uint32_t i = 0; i < num_subscriptions_; ++i) {
+            if (subscriptions_[i].id == id) {
+                subscriptions_[i] = std::move(subscriptions_[num_subscriptions_ - 1]);
+                --num_subscriptions_;
+                return {};
+            }
+        }
+        return std::unexpected(KernelError::not_found);
     }
 
     // ─── Queries ───────────────────────────────────────────────────────────
@@ -267,24 +331,34 @@ public:
      * @brief Number of PPS objects in the system.
      * @return Object count.
      */
-    [[nodiscard]] auto object_count() const -> std::size_t { return objects_.size(); }
+    [[nodiscard]] auto object_count() const -> std::size_t { return num_objects_; }
 
     /**
      * @brief Number of active subscriptions.
      * @return Subscription count.
      */
-    [[nodiscard]] auto subscription_count() const -> std::size_t { return subscriptions_.size(); }
+    [[nodiscard]] auto subscription_count() const -> std::size_t { return num_subscriptions_; }
+
+    /// @brief Fixed-capacity list of path views returned by list().
+    struct PathList {
+        std::array<std::string_view, max_pps_objects> paths = {};
+        std::uint32_t count = 0;
+        [[nodiscard]] auto size() const -> std::size_t { return count; }
+        [[nodiscard]] auto begin() const { return paths.data(); }
+        [[nodiscard]] auto end() const { return paths.data() + count; }
+    };
 
     /**
      * @brief List all PPS object paths under a given prefix.
      * @param prefix Path prefix to filter by.
-     * @return Vector of matching object paths.
+     * @return PathList of matching object paths.
      */
-    [[nodiscard]] auto list(std::string_view prefix) const -> std::vector<std::string_view> {
-        std::vector<std::string_view> result;
-        for (const auto& o : objects_) {
-            if (std::string_view{o.path}.starts_with(prefix)) {
-                result.push_back(o.path);
+    [[nodiscard]] auto list(std::string_view prefix) const -> PathList {
+        PathList result;
+        auto s = std::span{objects_.data(), num_objects_};
+        for (const auto& o : s) {
+            if (o.path.view().starts_with(prefix) && result.count < max_pps_objects) {
+                result.paths[result.count++] = o.path.view();
             }
         }
         return result;

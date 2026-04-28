@@ -36,28 +36,44 @@ struct Thread {
 using QueueChangeFn = std::function<void(ThreadId server, Priority max_waiter_priority)>;
 
 class Scheduler {
-    std::vector<Thread> threads_;
-    std::array<std::vector<ThreadId>, 256> ready_queues_;
+    std::array<Thread, max_threads> threads_ = {};
+    std::uint32_t num_threads_ = 0;
+
+    struct ReadyQueue {
+        std::array<ThreadId, max_ready_per_pri> entries = {};
+        std::uint32_t count = 0;
+    };
+    std::array<ReadyQueue, 256> ready_queues_ = {};
     std::bitset<256> ready_mask_;
     std::optional<ThreadId> current_;
     int next_tid_ = 1;
 
-    [[nodiscard]] auto find_thread(ThreadId tid) -> Thread* {
-        for (auto& t : threads_) {
-            if (t.id == tid) return &t;
+    [[nodiscard]] auto find_thread_idx(ThreadId tid) -> int {
+        auto s = std::span{threads_.data(), num_threads_};
+        for (std::uint32_t i = 0; i < num_threads_; ++i) {
+            if (threads_[i].id == tid) return static_cast<int>(i);
         }
-        return nullptr;
+        return -1;
     }
 
     auto enqueue_ready(ThreadId tid, Priority pri) -> void {
-        ready_queues_[pri.value].push_back(tid);
+        auto& q = ready_queues_[pri.value];
+        if (q.count < max_ready_per_pri) {
+            q.entries[q.count++] = tid;
+        }
         ready_mask_.set(pri.value);
     }
 
     auto dequeue_ready(ThreadId tid, Priority pri) -> void {
         auto& q = ready_queues_[pri.value];
-        std::erase(q, tid);
-        if (q.empty()) ready_mask_.reset(pri.value);
+        for (std::uint32_t i = 0; i < q.count; ++i) {
+            if (q.entries[i] == tid) {
+                q.entries[i] = q.entries[q.count - 1];
+                --q.count;
+                break;
+            }
+        }
+        if (q.count == 0) ready_mask_.reset(pri.value);
     }
 
 public:
@@ -70,11 +86,12 @@ public:
      * @return ThreadId of the newly created thread.
      */
     [[nodiscard]] auto thread_create(ProcessId pid, Priority pri) -> Result<ThreadId> {
+        if (num_threads_ >= max_threads) return std::unexpected(KernelError::no_memory);
         auto tid = ThreadId{next_tid_++};
-        threads_.push_back(Thread{
+        threads_[num_threads_++] = Thread{
             .id = tid, .pid = pid, .priority = pri,
             .effective_priority = pri, .state = ThreadState::ready
-        });
+        };
         enqueue_ready(tid, pri);
         return tid;
     }
@@ -85,11 +102,12 @@ public:
      * @return Void on success, KernelError::invalid_thread if not found.
      */
     [[nodiscard]] auto thread_destroy(ThreadId tid) -> VoidResult {
-        auto* t = find_thread(tid);
-        if (!t) return std::unexpected(KernelError::invalid_thread);
-        if (t->state == ThreadState::ready) dequeue_ready(tid, t->effective_priority);
+        auto ti = find_thread_idx(tid);
+        if (ti < 0) return std::unexpected(KernelError::invalid_thread);
+        auto& t = threads_[ti];
+        if (t.state == ThreadState::ready) dequeue_ready(tid, t.effective_priority);
         if (current_ == tid) current_ = std::nullopt;
-        t->state = ThreadState::dead;
+        t.state = ThreadState::dead;
         return {};
     }
 
@@ -104,12 +122,13 @@ public:
      * @return Void on success, error if thread is invalid or dead.
      */
     [[nodiscard]] auto thread_block(ThreadId tid, ThreadState reason) -> VoidResult {
-        auto* t = find_thread(tid);
-        if (!t) return std::unexpected(KernelError::invalid_thread);
-        if (t->state == ThreadState::dead) return std::unexpected(KernelError::dead_thread);
-        if (t->state == ThreadState::ready) dequeue_ready(tid, t->effective_priority);
+        auto ti = find_thread_idx(tid);
+        if (ti < 0) return std::unexpected(KernelError::invalid_thread);
+        auto& t = threads_[ti];
+        if (t.state == ThreadState::dead) return std::unexpected(KernelError::dead_thread);
+        if (t.state == ThreadState::ready) dequeue_ready(tid, t.effective_priority);
         if (current_ == tid) current_ = std::nullopt;
-        t->state = reason;
+        t.state = reason;
         return {};
     }
 
@@ -121,11 +140,12 @@ public:
      * @return Void on success, error if thread is invalid or dead.
      */
     [[nodiscard]] auto thread_unblock(ThreadId tid) -> VoidResult {
-        auto* t = find_thread(tid);
-        if (!t) return std::unexpected(KernelError::invalid_thread);
-        if (t->state == ThreadState::dead) return std::unexpected(KernelError::dead_thread);
-        t->state = ThreadState::ready;
-        enqueue_ready(tid, t->effective_priority);
+        auto ti = find_thread_idx(tid);
+        if (ti < 0) return std::unexpected(KernelError::invalid_thread);
+        auto& t = threads_[ti];
+        if (t.state == ThreadState::dead) return std::unexpected(KernelError::dead_thread);
+        t.state = ThreadState::ready;
+        enqueue_ready(tid, t.effective_priority);
         return {};
     }
 
@@ -139,13 +159,18 @@ public:
         if (ready_mask_.none()) return std::nullopt;
         // Find highest set bit (highest priority with ready threads)
         for (int p = max_priority; p >= 0; --p) {
-            if (ready_mask_.test(p) && !ready_queues_[p].empty()) {
-                auto tid = ready_queues_[p].front();
-                ready_queues_[p].erase(ready_queues_[p].begin());
-                if (ready_queues_[p].empty()) ready_mask_.reset(p);
+            if (ready_mask_.test(p) && ready_queues_[p].count > 0) {
+                auto& q = ready_queues_[p];
+                auto tid = q.entries[0];
+                // Shift remaining entries (FIFO order matters for round-robin at same priority)
+                for (std::uint32_t i = 0; i + 1 < q.count; ++i) {
+                    q.entries[i] = q.entries[i + 1];
+                }
+                --q.count;
+                if (q.count == 0) ready_mask_.reset(p);
 
-                auto* t = find_thread(tid);
-                if (t) t->state = ThreadState::running;
+                auto ti = find_thread_idx(tid);
+                if (ti >= 0) threads_[ti].state = ThreadState::running;
                 current_ = tid;
                 return tid;
             }
@@ -163,20 +188,21 @@ public:
         // Preemption: if a higher-priority thread is ready, preempt current
         if (!current_) { (void)schedule_next(); return; }
 
-        auto* curr = find_thread(*current_);
-        if (!curr || curr->state != ThreadState::running) {
+        auto ci = find_thread_idx(*current_);
+        if (ci < 0 || threads_[ci].state != ThreadState::running) {
             current_ = std::nullopt;
             (void)schedule_next();
             return;
         }
 
+        auto& curr = threads_[ci];
         if (ready_mask_.none()) return;
 
-        for (int p = max_priority; p > curr->effective_priority.value; --p) {
-            if (ready_mask_.test(p) && !ready_queues_[p].empty()) {
+        for (int p = max_priority; p > curr.effective_priority.value; --p) {
+            if (ready_mask_.test(p) && ready_queues_[p].count > 0) {
                 // Preempt: current goes back to ready
-                curr->state = ThreadState::ready;
-                enqueue_ready(curr->id, curr->effective_priority);
+                curr.state = ThreadState::ready;
+                enqueue_ready(curr.id, curr.effective_priority);
                 current_ = std::nullopt;
                 (void)schedule_next();
                 return;
@@ -192,7 +218,8 @@ public:
      * @return ThreadState on success, KernelError::invalid_thread if not found.
      */
     [[nodiscard]] auto get_state(ThreadId tid) const -> Result<ThreadState> {
-        for (const auto& t : threads_) {
+        auto s = std::span{threads_.data(), num_threads_};
+        for (const auto& t : s) {
             if (t.id == tid) return t.state;
         }
         return std::unexpected(KernelError::invalid_thread);
@@ -212,7 +239,8 @@ public:
      * @return Priority on success, KernelError::invalid_thread if not found.
      */
     [[nodiscard]] auto get_priority(ThreadId tid) const -> Result<Priority> {
-        for (const auto& t : threads_) {
+        auto s = std::span{threads_.data(), num_threads_};
+        for (const auto& t : s) {
             if (t.id == tid) return t.priority;
         }
         return std::unexpected(KernelError::invalid_thread);
@@ -224,7 +252,8 @@ public:
      * @return Effective priority on success, error if not found.
      */
     [[nodiscard]] auto get_effective_priority(ThreadId tid) const -> Result<Priority> {
-        for (const auto& t : threads_) {
+        auto s = std::span{threads_.data(), num_threads_};
+        for (const auto& t : s) {
             if (t.id == tid) return t.effective_priority;
         }
         return std::unexpected(KernelError::invalid_thread);
@@ -241,17 +270,18 @@ public:
      * @return Void on success, error if server not found.
      */
     [[nodiscard]] auto on_queue_change(ThreadId server_tid, Priority max_waiter_priority) -> VoidResult {
-        auto* t = find_thread(server_tid);
-        if (!t) return std::unexpected(KernelError::invalid_thread);
+        auto ti = find_thread_idx(server_tid);
+        if (ti < 0) return std::unexpected(KernelError::invalid_thread);
+        auto& t = threads_[ti];
 
-        auto old_eff = t->effective_priority;
-        auto new_eff = Priority{std::max(t->priority.value, max_waiter_priority.value)};
-        t->effective_priority = new_eff;
+        auto old_eff = t.effective_priority;
+        auto new_eff = Priority{std::max(t.priority.value, max_waiter_priority.value)};
+        t.effective_priority = new_eff;
 
         // Reposition in ready queue if priority changed and thread is ready
-        if (t->state == ThreadState::ready && old_eff != new_eff) {
-            dequeue_ready(t->id, old_eff);
-            enqueue_ready(t->id, new_eff);
+        if (t.state == ThreadState::ready && old_eff != new_eff) {
+            dequeue_ready(t.id, old_eff);
+            enqueue_ready(t.id, new_eff);
         }
 
         return {};
@@ -262,7 +292,8 @@ public:
      * @return Number of threads not in the dead state.
      */
     [[nodiscard]] auto thread_count() const -> std::size_t {
-        return std::ranges::count_if(threads_, [](const Thread& t) {
+        auto s = std::span{threads_.data(), num_threads_};
+        return std::ranges::count_if(s, [](const Thread& t) {
             return t.state != ThreadState::dead;
         });
     }
