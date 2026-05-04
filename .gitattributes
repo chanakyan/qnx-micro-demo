@@ -1,0 +1,6 @@
+*.fsx  linguist-language=F#
+*.fs   linguist-language=F#
+*.fsi  linguist-language=F#
+*.cppm linguist-language=C++
+*.als  linguist-language=Alloy
+*.lean linguist-language=Lean
